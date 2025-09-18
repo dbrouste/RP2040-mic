@@ -34,10 +34,10 @@ static constexpr uint8_t  ADC_GPIO = 27;  // A1 -> ADC1
 // Ring buffer sizing (samples, power-of-two)
 //static constexpr uint32_t RING_SAMPLES = 8192; // 16 KB (8192 * 2B) ≈ 21 ms @ 384k/16/mono
 // 8 KB ring window (power-of-two bytes). 4096 samples × 2 bytes = 8192 bytes.
-static constexpr uint32_t RING_SAMPLES = 4096;
+static constexpr uint32_t RING_SAMPLES = 8192;
 
 // MUST be aligned to the ring size in BYTES (8 KB here)
-static volatile uint16_t __attribute__((aligned(8192))) g_ring[RING_SAMPLES];
+static volatile uint16_t __attribute__((aligned(16384))) g_ring[RING_SAMPLES];
 
 // -------------------- Globals --------------------
 Adafruit_USBD_Audio usb;
@@ -47,6 +47,7 @@ static volatile uint32_t g_tail = 0;   // consumer index (samples)
 static int g_dma_chan = -1;
 static uint32_t g_underflows = 0;
 static volatile uint32_t g_lastStreamMs = 0;  // updated in readCB when host pulls
+static volatile int32_t g_dc_offset_12 = 2048; // 12-bit mid-code is ~2048 if your front-end is biased at Vref/2
 
 // DMA head helper: where DMA is writing now (as sample index)
 static inline uint32_t dma_head_samples() {
@@ -58,7 +59,19 @@ static inline uint32_t dma_head_samples() {
 
 // -------------------- WS2812 LED --------------------
 static void set_led(uint32_t color, uint8_t brightness) {
-  strip.setBrightness(brightness);     // 0..255 scales output
+  static uint32_t lastColor = 0xFFFFFFFF;
+  static uint8_t  lastBright = 255;
+  static uint32_t lastShow = 0;
+
+  uint32_t now = millis();
+  bool changed = (color != lastColor) || (brightness != lastBright);
+  if (!changed && (now - lastShow) < 20) return;  // ≤50 Hz updates
+
+  lastColor = color;
+  lastBright = brightness;
+  lastShow = now;
+
+  strip.setBrightness(brightness);
   strip.setPixelColor(0, color);
   strip.show();
 }
@@ -122,7 +135,7 @@ static void adc_dma_begin() {
   channel_config_set_dreq(&cfg, DREQ_ADC);                    // paced by ADC
 
   // 8 KB ring (2^13). Buffer is aligned(8192), so this is safe.
-  channel_config_set_ring(&cfg, true, 13);
+  channel_config_set_ring(&cfg, true, 14);
 
   dma_channel_configure(
       ch,
@@ -138,40 +151,110 @@ static void adc_dma_begin() {
   adc_run(true);
 }
 
+static uint16_t measure_dc_offset(uint32_t n = 4096) {
+  const uint32_t mask = RING_SAMPLES - 1;
+  uint32_t head = dma_head_samples();
+  uint32_t start = (head - n) & mask;
+  uint64_t acc = 0;
+  for (uint32_t i = 0; i < n; ++i) acc += g_ring[(start + i) & mask];
+  return (uint16_t)(acc / n);
+}
+
 
 // -------------------- USB audio callback --------------------
-size_t readCB(uint8_t* data, size_t len, Adafruit_USBD_Audio& ref) {
+size_t readCB(uint8_t* data, size_t len, Adafruit_USBD_Audio& /*ref*/) {
   g_lastStreamMs = millis();
 
-  uint16_t* out = reinterpret_cast<uint16_t*>(data);
-  uint32_t samples_needed = len / 2;
+  int16_t* out = reinterpret_cast<int16_t*>(data);   // SIGNED PCM16
+  const uint32_t samples_needed = len / 2;           // 384 @ 384 kHz
+  const uint32_t mask = RING_SAMPLES - 1;
 
-  // Compute available samples
-  uint32_t head = dma_head_samples();
-  uint32_t available = (head >= g_tail) ? (head - g_tail)
-                                        : (RING_SAMPLES - g_tail + head);
+  // Fixed latency behind DMA writer (keeps frames stable)
+  const uint32_t LAT_MS = 4;
+  const uint32_t LAT = LAT_MS * (SAMPLE_RATE_HZ / 1000u);  // 1536 @ 384k
+  const uint32_t head = dma_head_samples();
+  uint32_t start = (head - LAT - samples_needed) & mask;
 
-  if (available < samples_needed) {
-    // Not enough: copy available then zero pad
-    uint32_t i = 0;
-    for (; i < available; ++i) {
-      uint16_t s = g_ring[g_tail];
-      g_tail = (g_tail + 1) & (RING_SAMPLES - 1);
-      out[i] = (uint16_t)(s << 4); // 12-bit -> 16-bit
-    }
-    for (; i < samples_needed; ++i) out[i] = 0;
-    g_underflows++;
-    return len;
-  }
-
-  // Enough data
   for (uint32_t i = 0; i < samples_needed; ++i) {
-    uint16_t s = g_ring[g_tail];
-    g_tail = (g_tail + 1) & (RING_SAMPLES - 1);
-    out[i] = (uint16_t)(s << 4);
+    uint16_t s12 = g_ring[(start + i) & mask];            // 0..4095
+    int32_t v = ((int32_t)s12 - g_dc_offset_12) << 4;     // center, 12→16
+    if (v >  32767) v =  32767;                           // saturate (rare)
+    if (v < -32768) v = -32768;
+    out[i] = (int16_t)v;                                  // signed PCM
   }
+
+  // For stats/LED only
+  g_tail = (start + samples_needed) & mask;
   return len;
 }
+
+// size_t readCB(uint8_t* data, size_t len, Adafruit_USBD_Audio& /*ref*/) {
+//   g_lastStreamMs = millis();
+
+//   int16_t* out = reinterpret_cast<int16_t*>(data);   // signed PCM16
+//   const uint32_t N    = len / 2;                     // 384 @ 384 kHz
+//   const uint32_t mask = RING_SAMPLES - 1;
+//   const uint32_t head = dma_head_samples();
+
+//   // Target latency and small safety margin
+//   constexpr uint32_t LAT_MS = 6;                                   // try 6 ms
+//   constexpr uint32_t LAT    = LAT_MS * (SAMPLE_RATE_HZ / 1000u);   // 2304
+//   constexpr uint32_t GUARD  = 8;                                   // ~20 µs
+
+//   // Persistent read pointer and sync flag
+//   static bool     synced   = false;
+//   static uint32_t read_pos = 0;
+
+//   auto dist = [&](uint32_t a, uint32_t b)->uint32_t { return (b - a) & mask; };
+
+//   // Initial sync once: sit LAT+N behind the DMA writer
+//   if (!synced) {
+//     read_pos = (head - LAT - N) & mask;
+//     synced = true;
+//   }
+
+//   // How much is currently buffered ahead of us
+//   uint32_t available = dist(read_pos, head);
+
+//   // Soft PLL: keep available near target = LAT+N by nudging ±1 sample
+//   const int32_t target = (int32_t)LAT + (int32_t)N;
+//   int32_t d = (int32_t)available;
+//   if (d > (int32_t)(mask/2)) d -= (int32_t)(mask+1);    // wrap to signed
+//   int32_t err = d - target;
+//   int32_t adjust = (err >  32) ? +1 : (err < -32) ? -1 : 0;
+
+//   uint32_t start = (read_pos + (uint32_t)adjust) & mask;
+
+//   // Keep a tiny guard so we never read the word DMA is about to write
+//   uint32_t safe_avail = dist(start, head);
+//   uint32_t safe_to_copy = (safe_avail > GUARD) ? (safe_avail - GUARD) : 0;
+
+//   // We will ALWAYS output N samples. If short, we duplicate the last sample to fill.
+//   uint32_t to_copy = (safe_to_copy >= N) ? N : safe_to_copy;
+//   uint32_t i = 0;
+
+//   // Copy what is safely available
+//   int16_t last = 0;
+//   for (; i < to_copy; ++i) {
+//     uint16_t s12 = g_ring[(start + i) & mask];          // 0..4095
+//     int32_t v = ((int32_t)s12 - g_dc_offset_12) << 4;   // center, 12→16
+//     if (v >  32767) v =  32767;
+//     if (v < -32768) v = -32768;
+//     out[i] = last = (int16_t)v;
+//   }
+
+//   // If we were short, fill the remainder by repeating the last sample (no zeros)
+//   for (; i < N; ++i) out[i] = last;
+
+//   // Advance by EXACTLY what we consumed from the ring (not the padded part)
+//   read_pos = (start + to_copy) & mask;
+//   g_tail   = read_pos;     // for your LED/debug
+
+//   // (Optional) only count as underflow if we had to pad a lot, e.g. to_copy < N-8
+//   // if (to_copy + 8 < N) g_underflows++;
+
+//   return len;
+// }
 
 // -------------------- Arduino setup/loop --------------------
 void setup() {
@@ -208,6 +291,10 @@ void setup() {
 
   // Start ADC+DMA only after mount (enumeration stable)
   adc_dma_begin();
+
+  // in setup(), after adc_dma_begin();
+  delay(10);                               // let the ring fill a bit
+  g_dc_offset_12 = measure_dc_offset();    // replaces the 2048 guess
 }
 
 void loop() {
