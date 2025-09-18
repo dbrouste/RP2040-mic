@@ -119,7 +119,8 @@ static void adc_dma_begin() {
   // Target ~384 kS/s. ADC needs ~96 ADC clocks per sample.
   // clkdiv = f_adcclk / (Fs * 96). RP2040 accepts 16.8 fixed-point here.
   float clkdiv = 48000000.0f / (384000.0f * 96.0f);  // ≈ 1.302
-  adc_set_clkdiv(clkdiv);
+  //adc_set_clkdiv(clkdiv);
+  adc_set_clkdiv(127); //384kHz
 
   // --- DMA to ring ---
   g_underflows = 0;
